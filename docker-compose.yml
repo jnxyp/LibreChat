@@ -35,6 +35,7 @@ services:
     user: "${UID}:${GID}"
     volumes:
       - ./data-node:/data/db
+      - ./data-configdb:/data/configdb
     command: mongod --noauth
   meilisearch:
     container_name: chat-meilisearch
@@ -56,7 +57,7 @@ services:
       POSTGRES_PASSWORD: mypassword
     restart: always
     volumes:
-      - pgdata2:/var/lib/postgresql/data
+      - ./pgdata:/var/lib/postgresql/data
   rag_api:
     container_name: rag_api
     image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite:latest
@@ -69,5 +70,3 @@ services:
     env_file:
       - .env
 
-volumes:
-  pgdata2:
