@@ -71,6 +71,24 @@ describe('FlowStateManager', () => {
       expect(result2).toBe('result');
     });
 
+    it('should return the externally completed result when handler loses completion race', async () => {
+      const flowId = 'race-flow';
+      const type = 'test-type';
+
+      const result = await flowManager.createFlowWithHandler(flowId, type, async () => {
+        await flowManager.completeFlow(flowId, type, 'fresh-result');
+        return 'stale-result';
+      });
+
+      expect(result).toBe('fresh-result');
+      await expect(flowManager.getFlowState(flowId, type)).resolves.toEqual(
+        expect.objectContaining({
+          status: 'COMPLETED',
+          result: 'fresh-result',
+        }),
+      );
+    });
+
     it('should handle flow timeout correctly', async () => {
       const flowId = 'timeout-flow';
       const type = 'test-type';
@@ -84,6 +102,29 @@ describe('FlowStateManager', () => {
       const flowPromise = shortTtlManager.createFlow(flowId, type);
 
       await expect(flowPromise).rejects.toThrow('test-type flow timed out');
+    });
+
+    it('should retain a terminal timeout for the remaining storage TTL', async () => {
+      const flowId = 'retained-timeout-flow';
+      const type = 'mcp_oauth';
+      const shortTimeoutManager = new FlowStateManager(store as unknown as Keyv, {
+        ttl: 5000,
+        monitorTimeout: 100,
+        retainedFailureTypes: ['mcp_oauth'],
+        ci: true,
+      });
+
+      await expect(shortTimeoutManager.createFlow(flowId, type)).rejects.toThrow(
+        'mcp_oauth flow timed out',
+      );
+
+      await expect(shortTimeoutManager.getFlowState(flowId, type)).resolves.toEqual(
+        expect.objectContaining({
+          status: 'FAILED',
+          error: 'mcp_oauth flow timed out',
+          failedAt: expect.any(Number),
+        }),
+      );
     });
 
     it('should maintain flow state consistency under high concurrency', async () => {
@@ -156,7 +197,46 @@ describe('FlowStateManager', () => {
       await flowManager.failFlow(flowId, type, new Error('failure'));
 
       await expect(flowPromise).rejects.toThrow('failure');
+      await expect(flowManager.getFlowState(flowId, type)).resolves.toBeUndefined();
     }, 15000);
+
+    it('should retain configured failed flow types for status polling', async () => {
+      const flowId = 'retained-failure-flow';
+      const type = 'mcp_oauth';
+      const retainedManager = new FlowStateManager(store as unknown as Keyv, {
+        ttl: 5000,
+        retainedFailureTypes: [type],
+        ci: true,
+      });
+      const flowPromise = retainedManager.createFlow(flowId, type);
+
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await retainedManager.failFlow(flowId, type, new Error('provider rejected request'));
+
+      await expect(flowPromise).rejects.toThrow('provider rejected request');
+      await expect(retainedManager.getFlowState(flowId, type)).resolves.toEqual(
+        expect.objectContaining({ status: 'FAILED', error: 'provider rejected request' }),
+      );
+    }, 15000);
+
+    it('should not overwrite a completed flow with a late failure', async () => {
+      const flowId = 'completed-race-flow';
+      const type = 'test-type';
+      const flowKey = `${type}:${flowId}`;
+
+      await flowManager.initFlow(flowId, type);
+      await flowManager.completeFlow(flowId, type, 'success');
+
+      const result = await flowManager.failFlow(flowId, type, new Error('late failure'));
+      const state = await store.get(flowKey);
+
+      expect(result).toBe(true);
+      expect(state).toMatchObject({
+        status: 'COMPLETED',
+        result: 'success',
+      });
+      expect(state?.error).toBeUndefined();
+    });
   });
 
   describe('initFlow', () => {

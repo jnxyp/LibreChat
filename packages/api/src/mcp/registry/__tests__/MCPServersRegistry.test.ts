@@ -2,6 +2,7 @@ import { logger } from '@librechat/data-schemas';
 import type * as t from '~/mcp/types';
 import { MCPServersRegistry } from '~/mcp/registry/MCPServersRegistry';
 import { MCPServerInspector } from '~/mcp/registry/MCPServerInspector';
+import { processMCPEnv } from '~/utils/env';
 
 // Mock MCPServerInspector to avoid actual server connections
 jest.mock('~/mcp/registry/MCPServerInspector');
@@ -163,6 +164,26 @@ describe('MCPServersRegistry', () => {
     });
   });
 
+  describe('isAppServerConfig', () => {
+    it('rejects a same-name tenant override that inherited the YAML source tag', async () => {
+      const baseConfig = {
+        ...testParsedConfig,
+        source: 'yaml' as const,
+        url: 'https://base.example.com/mcp',
+        type: 'streamable-http' as const,
+      };
+      await registry['cacheConfigsRepo'].add('shared', baseConfig);
+
+      await expect(registry.isAppServerConfig('shared', baseConfig)).resolves.toBe(true);
+      await expect(
+        registry.isAppServerConfig('shared', {
+          ...baseConfig,
+          url: 'https://tenant.example.com/mcp',
+        }),
+      ).resolves.toBe(false);
+    });
+  });
+
   describe('addServer', () => {
     it('should pass user source to inspector before storing DB servers', async () => {
       const inspectSpy = jest.spyOn(MCPServerInspector, 'inspect');
@@ -220,6 +241,271 @@ describe('MCPServersRegistry', () => {
     });
   });
 
+  /**
+   * Agent Plugins servers reach the registry through the same startup path as
+   * librechat.yaml servers. Deriving `source` from the storage tier alone used to
+   * retag them `'yaml'`, which dropped the marker `processMCPEnv` needs to keep
+   * plugin-authored placeholders literal and let a plugin exfiltrate `process.env`
+   * secrets through its own headers.
+   */
+  describe('plugin provenance', () => {
+    const pluginConfig: t.ParsedServerConfig = {
+      source: 'plugin',
+      type: 'streamable-http',
+      url: 'https://plugin.example.com/mcp',
+      headers: { Authorization: 'Bearer ${TEST_PLUGIN_SECRET}' },
+    };
+
+    it('keeps the plugin marker through inspection and cache storage', async () => {
+      const inspectSpy = jest.spyOn(MCPServerInspector, 'inspect');
+
+      const result = await registry.addServer('plugin_server', pluginConfig, 'CACHE');
+
+      expect(inspectSpy).toHaveBeenCalledWith(
+        'plugin_server',
+        expect.objectContaining({
+          source: 'plugin',
+          headers: { Authorization: 'Bearer ${TEST_PLUGIN_SECRET}' },
+        }),
+        undefined,
+        undefined,
+        undefined,
+      );
+      expect(result.config.source).toBe('plugin');
+      await expect(registry['cacheConfigsRepo'].get('plugin_server')).resolves.toMatchObject({
+        source: 'plugin',
+        headers: { Authorization: 'Bearer ${TEST_PLUGIN_SECRET}' },
+      });
+    });
+
+    it('still tags operator-authored cache servers as yaml', async () => {
+      const result = await registry.addServer('yaml_server', { ...testParsedConfig }, 'CACHE');
+
+      expect(result.config.source).toBe('yaml');
+    });
+
+    it('keeps the plugin marker on a recovery stub when inspection fails', async () => {
+      const result = await registry.addServerStub('plugin_server', pluginConfig, 'CACHE');
+
+      expect(result.config).toMatchObject({ source: 'plugin', inspectionFailed: true });
+    });
+
+    it('keeps the plugin marker through config-tier lazy init', async () => {
+      const result = await registry.ensureConfigServers({ plugin_server: pluginConfig });
+
+      expect(result.plugin_server.source).toBe('plugin');
+    });
+
+    it('never lets a DB-stored config claim plugin provenance', async () => {
+      const inspectSpy = jest.spyOn(MCPServerInspector, 'inspect');
+
+      const result = await registry.addServer('forged_server', pluginConfig, 'DB', 'user-1');
+
+      expect(inspectSpy).toHaveBeenCalledWith(
+        'forged_server',
+        expect.objectContaining({ source: 'user' }),
+        undefined,
+        undefined,
+        undefined,
+      );
+      expect(result.config.source).toBe('user');
+    });
+
+    it('leaves a plugin-authored header literal after a registry round trip', async () => {
+      process.env.TEST_PLUGIN_SECRET = 'host-secret-value';
+      try {
+        await registry.addServer('plugin_server', pluginConfig, 'CACHE');
+        const stored = await registry.getServerConfig('plugin_server');
+        expect(stored).toBeDefined();
+
+        const runtimeConfig = processMCPEnv({ options: stored! });
+
+        expect(runtimeConfig).toMatchObject({
+          headers: { Authorization: 'Bearer ${TEST_PLUGIN_SECRET}' },
+        });
+      } finally {
+        delete process.env.TEST_PLUGIN_SECRET;
+      }
+    });
+
+    /**
+     * An operator Config override that shadows a same-name plugin base must keep
+     * its own trusted `'config'` source. Inheriting the base's `'plugin'` marker
+     * would make `processMCPEnv` stop resolving the operator's own placeholders
+     * and silently break their server.
+     */
+    it('does not lend plugin provenance to an operator config override of the same name', async () => {
+      const pluginBase: t.ParsedServerConfig = {
+        source: 'plugin',
+        type: 'streamable-http',
+        url: 'https://plugin.example.com/mcp',
+        requiresOAuth: false,
+      };
+      await registry['cacheConfigsRepo'].add('shared', pluginBase);
+
+      const override: t.ParsedServerConfig = {
+        source: 'config',
+        type: 'streamable-http',
+        url: 'https://operator.example.com/mcp',
+        headers: { Authorization: 'Bearer ${TEST_OPERATOR_SECRET}' },
+        requiresOAuth: false,
+      };
+
+      const all = await registry.getAllServerConfigs('user-1', { shared: override });
+      expect(all.shared.source).toBe('config');
+
+      const single = await registry.getServerConfig('shared', 'user-1', { shared: override });
+      expect(single?.source).toBe('config');
+
+      process.env.TEST_OPERATOR_SECRET = 'operator-secret-value';
+      try {
+        const runtimeConfig = processMCPEnv({ options: all.shared });
+        expect(runtimeConfig).toMatchObject({
+          headers: { Authorization: 'Bearer operator-secret-value' },
+        });
+      } finally {
+        delete process.env.TEST_OPERATOR_SECRET;
+      }
+    });
+
+    it('keeps a process-backed plugin server authoritative over config-tier overrides', async () => {
+      const pluginBase: t.ParsedServerConfig = {
+        source: 'plugin',
+        type: 'stdio',
+        command: 'node',
+        args: ['trusted-plugin-server.js'],
+      };
+      await registry['cacheConfigsRepo'].add('shared-process', pluginBase);
+
+      const override: t.ParsedServerConfig = {
+        source: 'config',
+        type: 'streamable-http',
+        url: 'https://override.example.com/mcp',
+        requiresOAuth: false,
+      };
+
+      const all = await registry.getAllServerConfigs('user-1', {
+        'shared-process': override,
+      });
+      expect(all['shared-process']).toMatchObject(pluginBase);
+      expect(all['shared-process']).not.toHaveProperty('url');
+
+      const single = await registry.getServerConfig('shared-process', 'user-1', {
+        'shared-process': override,
+      });
+      expect(single).toMatchObject(pluginBase);
+      expect(single).not.toHaveProperty('url');
+    });
+  });
+
+  describe('resolveAllowlists (per-request, tenant-scoped)', () => {
+    const createWith = (
+      allowedDomains?: string[] | null,
+      allowedAddresses?: string[] | null,
+      resolver?: (ctx?: { userId?: string; role?: string }) => Promise<{
+        allowedDomains?: string[] | null;
+        allowedAddresses?: string[] | null;
+      }>,
+    ): MCPServersRegistry => {
+      (MCPServersRegistry as unknown as { instance: undefined }).instance = undefined;
+      MCPServersRegistry.createInstance(mockMongoose, allowedDomains, allowedAddresses, resolver);
+      return MCPServersRegistry.getInstance();
+    };
+
+    it('returns the YAML base allowlists when no resolver is injected', async () => {
+      const reg = createWith(['yaml.com'], ['10.0.0.0/8']);
+      await expect(reg.resolveAllowlists()).resolves.toEqual({
+        allowedDomains: ['yaml.com'],
+        allowedAddresses: ['10.0.0.0/8'],
+        useSSRFProtection: false,
+      });
+    });
+
+    it('enables SSRF protection when the effective allowlist is empty', async () => {
+      const reg = createWith(undefined, undefined);
+      await expect(reg.resolveAllowlists()).resolves.toEqual({
+        allowedDomains: undefined,
+        allowedAddresses: undefined,
+        useSSRFProtection: true,
+      });
+    });
+
+    it('returns the resolver-provided merged allowlists and forwards the context', async () => {
+      const resolver = jest.fn().mockResolvedValue({
+        allowedDomains: ['admin-added.com'],
+        allowedAddresses: ['172.16.0.0/12'],
+      });
+      const reg = createWith(['yaml.com'], null, resolver);
+
+      const result = await reg.resolveAllowlists({ userId: 'u1', role: 'ADMIN' });
+
+      expect(resolver).toHaveBeenCalledWith({ userId: 'u1', role: 'ADMIN' });
+      expect(result).toEqual({
+        allowedDomains: ['admin-added.com'],
+        allowedAddresses: ['172.16.0.0/12'],
+        useSSRFProtection: false,
+      });
+    });
+
+    it('falls back to the YAML base allowlists when the resolver throws', async () => {
+      const resolver = jest.fn().mockRejectedValue(new Error('DB down'));
+      const reg = createWith(['yaml.com'], null, resolver);
+
+      await expect(reg.resolveAllowlists()).resolves.toEqual({
+        allowedDomains: ['yaml.com'],
+        allowedAddresses: null,
+        useSSRFProtection: false,
+      });
+    });
+
+    it('inspects against the resolved (admin-panel) allowlist, not the YAML base', async () => {
+      const resolver = jest.fn().mockResolvedValue({
+        allowedDomains: ['admin-added.com'],
+        allowedAddresses: ['10.0.0.0/8'],
+      });
+      const reg = createWith(['yaml-only.com'], null, resolver);
+      const inspectSpy = jest.spyOn(MCPServerInspector, 'inspect');
+      await reg.reset();
+
+      await reg.addServer(
+        'admin_panel_server',
+        { type: 'streamable-http', url: 'https://admin-added.com/mcp' },
+        'DB',
+        'user-1',
+      );
+
+      expect(resolver).toHaveBeenCalledWith({ userId: 'user-1' });
+      expect(inspectSpy).toHaveBeenCalledWith(
+        'admin_panel_server',
+        expect.objectContaining({ url: 'https://admin-added.com/mcp' }),
+        undefined,
+        ['admin-added.com'],
+        ['10.0.0.0/8'],
+      );
+    });
+
+    it('scopes the config-source cache key by the resolved allowlist (no cross-tenant poison)', async () => {
+      const resolver = jest
+        .fn()
+        .mockResolvedValueOnce({ allowedDomains: ['a.com'], allowedAddresses: null })
+        .mockResolvedValueOnce({ allowedDomains: ['b.com'], allowedAddresses: null });
+      const reg = createWith(null, null, resolver);
+      const inspectSpy = jest.spyOn(MCPServerInspector, 'inspect');
+      await reg.reset();
+      inspectSpy.mockClear();
+
+      const cfg = {
+        srv: { type: 'streamable-http' as const, url: 'https://srv.example.com/mcp' },
+      };
+      await reg.ensureConfigServers(cfg); // resolver call 1 → allowlist A
+      await reg.ensureConfigServers(cfg); // resolver call 2 → allowlist B (distinct key)
+
+      // Different resolved allowlists ⇒ different cache keys ⇒ the second pass re-inspects
+      // instead of reusing the first allowlist's cached entry.
+      expect(inspectSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe('reset', () => {
     it('should clear all servers from cache repository', async () => {
       // Add servers to cache using the new API
@@ -273,6 +559,29 @@ describe('MCPServersRegistry', () => {
         if (config && 'command' in config) {
           expect(config.command).toBe('python');
         }
+      });
+
+      it('separates update inspection from persistence', async () => {
+        await registry.addServer('cache_server', testParsedConfig, 'CACHE');
+        const updatedConfig = { ...testParsedConfig, command: 'python' } as t.ParsedServerConfig;
+
+        const inspected = await registry.inspectServerUpdate(
+          'cache_server',
+          updatedConfig,
+          'CACHE',
+        );
+
+        const beforeCommit = await registry['cacheConfigsRepo'].get('cache_server');
+        expect(beforeCommit && 'command' in beforeCommit ? beforeCommit.command : undefined).toBe(
+          'node',
+        );
+
+        await registry.commitServerUpdate('cache_server', inspected, 'CACHE');
+
+        const afterCommit = await registry['cacheConfigsRepo'].get('cache_server');
+        expect(afterCommit && 'command' in afterCommit ? afterCommit.command : undefined).toBe(
+          'python',
+        );
       });
 
       it('should route removeServer to cache repository', async () => {

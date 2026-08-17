@@ -8,8 +8,10 @@ import {
   interfaceSchema,
   fileStorageSchema,
   fileStrategiesSchema,
+  SKILL_SYNC_MAX_INTERVAL_MINUTES,
   summarizationTriggerSchema,
   summarizationConfigSchema,
+  retainRecentConfigSchema,
   MAX_SUBAGENTS,
 } from '../src/config';
 import {
@@ -18,7 +20,7 @@ import {
   ReasoningParameterFormat,
   ReasoningResponseKey,
 } from '../src/schemas';
-import { specsConfigSchema } from '../src/models';
+import { specsConfigSchema, materializeModelSpecEndpoints } from '../src/models';
 import { FileSources } from '../src/types/files';
 
 describe('paramDefinitionSchema', () => {
@@ -403,6 +405,27 @@ describe('endpointSchema addParams validation', () => {
 });
 
 describe('agentsEndpointSchema', () => {
+  it('accepts a non-empty stateful code environment allowlist', () => {
+    const result = agentsEndpointSchema.safeParse({
+      statefulCodeSessions: { allowedEnvironments: ['user', 'agent-user'] },
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects empty or unknown stateful code environment allowlists', () => {
+    expect(
+      agentsEndpointSchema.safeParse({
+        statefulCodeSessions: { allowedEnvironments: [] },
+      }).success,
+    ).toBe(false);
+    expect(
+      agentsEndpointSchema.safeParse({
+        statefulCodeSessions: { allowedEnvironments: ['agent'] },
+      }).success,
+    ).toBe(false);
+  });
+
   it('does not accept baseURL', () => {
     const result = agentsEndpointSchema.safeParse({
       baseURL: 'https://example.com',
@@ -681,6 +704,294 @@ describe('configSchema fileStrategy', () => {
   });
 });
 
+describe('configSchema skillSync', () => {
+  it('accepts a GitHub skill sync source with explicit paths and credential key', () => {
+    const result = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          intervalMinutes: 60,
+          runOnStartup: true,
+          sources: [
+            {
+              id: 'librechat-skills',
+              owner: 'LibreChat',
+              repo: 'skills',
+              ref: 'main',
+              paths: ['skills', '.'],
+              credentialKey: 'github-skills-prod',
+            },
+          ],
+        },
+      },
+    });
+    expect(result.success).toBe(true);
+    expect(result.data?.skillSync?.github?.sources[0]?.paths).toEqual(['skills', '']);
+    expect(result.data?.skillSync?.github?.sources[0]?.skillDiscoveryDepth).toBeUndefined();
+  });
+
+  it('accepts a GitHub skill sync source with an env-backed token and discovery depth', () => {
+    const result = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          sources: [
+            {
+              id: 'mattpocock-skills',
+              owner: 'mattpocock',
+              repo: 'skills',
+              paths: ['skills'],
+              skillDiscoveryDepth: 3,
+              token: '${GITHUB_SKILLS_TOKEN}',
+            },
+          ],
+        },
+      },
+    });
+    expect(result.success).toBe(true);
+    expect(result.data?.skillSync?.github?.sources[0]?.token).toBe('${GITHUB_SKILLS_TOKEN}');
+    expect(result.data?.skillSync?.github?.sources[0]?.skillDiscoveryDepth).toBe(3);
+  });
+
+  it('accepts an optional tenantId on a GitHub skill sync source', () => {
+    const result = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          sources: [
+            {
+              id: 'librechat-skills',
+              owner: 'LibreChat',
+              repo: 'skills',
+              paths: ['skills'],
+              credentialKey: 'github-skills-prod',
+              tenantId: 'tenant-a',
+            },
+          ],
+        },
+      },
+    });
+    expect(result.success).toBe(true);
+    expect(result.data?.skillSync?.github?.sources[0]?.tenantId).toBe('tenant-a');
+  });
+
+  it('rejects the reserved system tenant id on a GitHub skill sync source', () => {
+    const result = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          sources: [
+            {
+              id: 'librechat-skills',
+              owner: 'LibreChat',
+              repo: 'skills',
+              paths: ['skills'],
+              credentialKey: 'github-skills-prod',
+              tenantId: '__SYSTEM__',
+            },
+          ],
+        },
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects enabled GitHub skill sync without sources', () => {
+    const result = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          sources: [],
+        },
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects GitHub skill sync intervals below five minutes', () => {
+    const result = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          intervalMinutes: 4,
+          sources: [
+            {
+              id: 'librechat-skills',
+              owner: 'LibreChat',
+              repo: 'skills',
+              paths: ['skills'],
+              credentialKey: 'github-skills-prod',
+            },
+          ],
+        },
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects GitHub skill sync intervals above the Node timer limit', () => {
+    const result = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          intervalMinutes: SKILL_SYNC_MAX_INTERVAL_MINUTES + 1,
+          sources: [
+            {
+              id: 'librechat-skills',
+              owner: 'LibreChat',
+              repo: 'skills',
+              paths: ['skills'],
+              credentialKey: 'github-skills-prod',
+            },
+          ],
+        },
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects unsafe GitHub skill sync paths and credential keys', () => {
+    const result = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          sources: [
+            {
+              id: 'librechat-skills',
+              owner: 'LibreChat',
+              repo: 'skills',
+              paths: ['../skills'],
+              credentialKey: '../token',
+            },
+          ],
+        },
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects GitHub skill sync sources without credentials or with literal tokens', () => {
+    const missingCredential = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          sources: [
+            {
+              id: 'librechat-skills',
+              owner: 'LibreChat',
+              repo: 'skills',
+              paths: ['skills'],
+            },
+          ],
+        },
+      },
+    });
+    const literalToken = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          sources: [
+            {
+              id: 'librechat-skills',
+              owner: 'LibreChat',
+              repo: 'skills',
+              paths: ['skills'],
+              token: 'github_pat_secret',
+            },
+          ],
+        },
+      },
+    });
+    const duplicateCredentialSources = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          sources: [
+            {
+              id: 'librechat-skills',
+              owner: 'LibreChat',
+              repo: 'skills',
+              paths: ['skills'],
+              credentialKey: 'github-skills-prod',
+              token: '${GITHUB_SKILLS_TOKEN}',
+            },
+          ],
+        },
+      },
+    });
+    expect(missingCredential.success).toBe(false);
+    expect(literalToken.success).toBe(false);
+    expect(duplicateCredentialSources.success).toBe(false);
+  });
+
+  it('rejects GitHub skill sync discovery depths outside the allowed range', () => {
+    const result = configSchema.safeParse({
+      version: '1.3.11',
+      skillSync: {
+        github: {
+          enabled: true,
+          sources: [
+            {
+              id: 'librechat-skills',
+              owner: 'LibreChat',
+              repo: 'skills',
+              paths: ['skills'],
+              credentialKey: 'github-skills-prod',
+              skillDiscoveryDepth: 11,
+            },
+          ],
+        },
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects malformed GitHub skill sync refs during config validation', () => {
+    const invalidRefs = [
+      'feature branch',
+      'release:2026',
+      'bad?ref',
+      'bad*ref',
+      '[bad]',
+      '@{upstream}',
+      'main.lock',
+    ];
+
+    for (const ref of invalidRefs) {
+      const result = configSchema.safeParse({
+        version: '1.3.11',
+        skillSync: {
+          github: {
+            enabled: true,
+            sources: [
+              {
+                id: 'librechat-skills',
+                owner: 'LibreChat',
+                repo: 'skills',
+                ref,
+                paths: ['skills'],
+                credentialKey: 'github-skills-prod',
+              },
+            ],
+          },
+        },
+      });
+      expect(result.success).toBe(false);
+    }
+  });
+});
+
 describe('interfaceSchema', () => {
   it('silently strips removed legacy fields', () => {
     const result = interfaceSchema.parse({
@@ -701,6 +1012,20 @@ describe('interfaceSchema', () => {
 
     expect(result.retentionMode).toBe(RetentionMode.ALL);
     expect(result.retainAgentFiles).toBe(true);
+  });
+
+  it('accepts defaultPinnedTools as a string array', () => {
+    const result = interfaceSchema.parse({
+      defaultPinnedTools: ['artifacts', 'execute_code', 'mcp'],
+    });
+
+    expect(result.defaultPinnedTools).toEqual(['artifacts', 'execute_code', 'mcp']);
+  });
+
+  it('leaves defaultPinnedTools undefined when not provided', () => {
+    const result = interfaceSchema.parse({ modelSelect: true });
+
+    expect(result.defaultPinnedTools).toBeUndefined();
   });
 });
 
@@ -810,6 +1135,35 @@ describe('summarizationTriggerSchema', () => {
   });
 });
 
+describe('retainRecentConfigSchema', () => {
+  it('accepts turn and token retention limits', () => {
+    const result = retainRecentConfigSchema.safeParse({
+      turns: 5,
+      tokens: 40000,
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects invalid turn and token retention limits', () => {
+    expect(retainRecentConfigSchema.safeParse({ turns: -1 }).success).toBe(false);
+    expect(retainRecentConfigSchema.safeParse({ turns: 21 }).success).toBe(false);
+    expect(retainRecentConfigSchema.safeParse({ tokens: 0 }).success).toBe(false);
+  });
+
+  it('parses inside the full summarization config', () => {
+    const result = summarizationConfigSchema.safeParse({
+      enabled: true,
+      retainRecent: { turns: 5, tokens: 40000 },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.retainRecent).toEqual({ turns: 5, tokens: 40000 });
+    }
+  });
+});
+
 describe('specsConfigSchema', () => {
   it('accepts an empty list (defaults applied)', () => {
     const result = specsConfigSchema.safeParse({ list: [] });
@@ -860,6 +1214,100 @@ describe('specsConfigSchema', () => {
     expect(result.success).toBe(false);
   });
 
+  /**
+   * The endpoint is inferable from `agent_id`, so config validation must not
+   * reject the spec before `materializeModelSpecEndpoints` can fill it in.
+   */
+  it('accepts an agent spec whose preset omits endpoint', () => {
+    const result = specsConfigSchema.safeParse({
+      list: [
+        {
+          name: 'agent-spec',
+          label: 'Agent Spec',
+          preset: { agent_id: 'agent_abc' },
+        },
+      ],
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.list[0].preset.agent_id).toBe('agent_abc');
+      expect(result.data.list[0].preset.endpoint).toBeUndefined();
+    }
+  });
+
+  /** Omission is only legal when inferable — a preset naming no agent still needs the key. */
+  it('rejects an endpoint-less preset that names no agent', () => {
+    const result = specsConfigSchema.safeParse({
+      list: [{ name: 'dead-spec', label: 'Dead Spec', preset: { model: 'gpt-4o' } }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  /** `endpoint: null` validated before the key became optional; it must keep validating. */
+  it('still accepts an explicit null endpoint without an agent', () => {
+    const result = specsConfigSchema.safeParse({
+      list: [{ name: 'null-spec', label: 'Null Spec', preset: { endpoint: null } }],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  /** Form-backed writers persist untouched fields as `''`, which names no agent. */
+  it('rejects an endpoint-less preset whose agent_id is an empty string', () => {
+    const result = specsConfigSchema.safeParse({
+      list: [{ name: 'empty-agent', label: 'Empty Agent', preset: { agent_id: '' } }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  /**
+   * An explicit `endpoint: null` is a statement, not an omission: such specs
+   * validated and stayed inert before inference existed, and must remain so.
+   */
+  it('does not infer over an explicit null endpoint, even with an agent_id', () => {
+    const parsed = specsConfigSchema.parse({
+      list: [
+        {
+          name: 'null-agent-spec',
+          label: 'Null Agent Spec',
+          preset: { endpoint: null, agent_id: 'agent_abc' },
+        },
+      ],
+    });
+
+    const materialized = materializeModelSpecEndpoints(parsed);
+
+    expect(materialized.list[0].preset.endpoint).toBeNull();
+    expect(materialized).toBe(parsed);
+  });
+
+  it('materializes the inferred endpoint onto parsed agent specs', () => {
+    const parsed = specsConfigSchema.parse({
+      list: [
+        { name: 'agent-spec', label: 'Agent Spec', preset: { agent_id: 'agent_abc' } },
+        {
+          name: 'explicit-spec',
+          label: 'Explicit Spec',
+          preset: { endpoint: EModelEndpoint.openAI, agent_id: 'agent_abc' },
+        },
+        { name: 'bare-spec', label: 'Bare Spec', preset: { endpoint: null } },
+      ],
+    });
+
+    const materialized = materializeModelSpecEndpoints(parsed);
+
+    expect(materialized.list[0].preset.endpoint).toBe(EModelEndpoint.agents);
+    expect(materialized.list[1].preset.endpoint).toBe(EModelEndpoint.openAI);
+    expect(materialized.list[1]).toBe(parsed.list[1]);
+    expect(materialized.list[2].preset.endpoint).toBeNull();
+  });
+
+  it('returns the same object when every spec already has an endpoint', () => {
+    const parsed = specsConfigSchema.parse({
+      list: [{ name: 'spec', label: 'Spec', preset: { endpoint: EModelEndpoint.openAI } }],
+    });
+    expect(materializeModelSpecEndpoints(parsed)).toBe(parsed);
+  });
+
   it('rejects model spec subagent ids above the shared cap', () => {
     const oversized = Array.from({ length: MAX_SUBAGENTS + 1 }, (_, i) => `agent_${i}`);
     const result = specsConfigSchema.safeParse({
@@ -873,5 +1321,32 @@ describe('specsConfigSchema', () => {
       ],
     });
     expect(result.success).toBe(false);
+  });
+});
+
+describe('configSchema langfuse', () => {
+  it('accepts tenant Langfuse connection config', () => {
+    const result = configSchema.safeParse({
+      version: '1.3.7',
+      langfuse: {
+        enabled: true,
+        publicKey: 'pk-lf-tenant',
+        secretKey: 'sk-lf-tenant',
+        destination: 'eu',
+      },
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts an explicit tenant Langfuse opt-out', () => {
+    const result = configSchema.safeParse({
+      version: '1.3.7',
+      langfuse: {
+        enabled: false,
+      },
+    });
+
+    expect(result.success).toBe(true);
   });
 });

@@ -1,16 +1,18 @@
 import { INTERFACE_PERMISSION_FIELDS, PermissionTypes } from 'librechat-data-provider';
-import { mergeConfigOverrides } from './resolution';
 import type { AppConfig, IConfig } from '~/types';
+import { BASE_CONFIG_PRINCIPAL_ID } from '~/admin/capabilities';
+import { mergeConfigOverrides } from './resolution';
 
 function fakeConfig(
   overrides: Record<string, unknown>,
   priority: number,
   tombstones?: string[],
+  principalId = 'test',
 ): IConfig {
   return {
     _id: 'fake',
     principalType: 'role',
-    principalId: 'test',
+    principalId,
     principalModel: 'Role',
     priority,
     overrides,
@@ -34,6 +36,37 @@ describe('mergeConfigOverrides', () => {
   it('returns base config when configs is null/undefined', () => {
     expect(mergeConfigOverrides(baseConfig, null as unknown as IConfig[])).toBe(baseConfig);
     expect(mergeConfigOverrides(baseConfig, undefined as unknown as IConfig[])).toBe(baseConfig);
+  });
+
+  it('applies tenant-wide Langfuse settings only from the base principal', () => {
+    const configs = [
+      fakeConfig(
+        { langfuse: { enabled: true, destination: 'eu', publicKey: 'pk-base' } },
+        10,
+        undefined,
+        BASE_CONFIG_PRINCIPAL_ID,
+      ),
+      fakeConfig({ langfuse: { enabled: false, publicKey: 'pk-role' } }, 100),
+    ];
+
+    const result = mergeConfigOverrides(baseConfig, configs);
+
+    expect(result.langfuse).toMatchObject({
+      enabled: true,
+      destination: 'eu',
+      publicKey: 'pk-base',
+    });
+  });
+
+  it('ignores tenant-wide Langfuse tombstones outside the base principal', () => {
+    const base = {
+      ...baseConfig,
+      langfuse: { enabled: true, destination: 'eu', publicKey: 'pk-base' },
+    } as AppConfig;
+
+    const result = mergeConfigOverrides(base, [fakeConfig({}, 100, ['langfuse'])]);
+
+    expect(result.langfuse).toEqual(base.langfuse);
   });
 
   it('deep merges interface UI fields into interfaceConfig', () => {
@@ -347,6 +380,66 @@ describe('mergeConfigOverrides', () => {
     expect(iface.parameters).toBe(true);
   });
 
+  it('merges skillSync config sections from DB overrides', () => {
+    const base = {
+      skillSync: {
+        github: {
+          enabled: true,
+          intervalMinutes: 60,
+          runOnStartup: false,
+          sources: [
+            {
+              id: 'base-source',
+              owner: 'LibreChat',
+              repo: 'skills',
+              ref: 'main',
+              paths: ['skills'],
+              token: '${GITHUB_SKILLS_TOKEN}',
+            },
+          ],
+        },
+      },
+      interfaceConfig: { modelSelect: true },
+    } as unknown as AppConfig;
+
+    const configs = [
+      fakeConfig(
+        {
+          skillSync: {
+            github: {
+              enabled: false,
+              sources: [
+                {
+                  id: 'override-source',
+                  owner: 'other',
+                  repo: 'skills',
+                  paths: ['skills'],
+                  token: '${OTHER_TOKEN}',
+                },
+              ],
+            },
+          },
+          interface: { modelSelect: false },
+        },
+        10,
+      ),
+    ];
+
+    const result = mergeConfigOverrides(base, configs);
+
+    expect(result.skillSync?.github?.enabled).toBe(false);
+    expect(result.skillSync?.github?.sources).toEqual([
+      {
+        id: 'override-source',
+        owner: 'other',
+        repo: 'skills',
+        paths: ['skills'],
+        token: '${OTHER_TOKEN}',
+      },
+    ]);
+    expect(result.interfaceConfig?.modelSelect).toBe(false);
+  });
+
   it('preserves UI sub-keys in composite permission fields like mcpServers', () => {
     const base = {
       interfaceConfig: {},
@@ -432,6 +525,113 @@ describe('mergeConfigOverrides', () => {
     expect(result.mcpServers).toBeUndefined();
   });
 
+  it('drops process-backed MCP servers from database overrides', () => {
+    const base = {
+      ...baseConfig,
+      mcpConfig: {
+        operator: { type: 'stdio', command: 'node', args: ['trusted-server.js'] },
+      },
+    } as unknown as AppConfig;
+    const configs = [
+      fakeConfig(
+        {
+          mcpServers: {
+            injected: { type: 'stdio', command: '/bin/sh', args: ['-c', 'id'] },
+            remote: { type: 'streamable-http', url: 'https://mcp.example.com' },
+          },
+        },
+        10,
+      ),
+    ];
+
+    const result = mergeConfigOverrides(base, configs) as unknown as Record<string, unknown>;
+    const mcpConfig = result.mcpConfig as Record<string, unknown>;
+
+    expect(mcpConfig.injected).toBeUndefined();
+    expect(mcpConfig.remote).toEqual({
+      type: 'streamable-http',
+      url: 'https://mcp.example.com',
+    });
+    expect(mcpConfig.operator).toEqual({
+      type: 'stdio',
+      command: 'node',
+      args: ['trusted-server.js'],
+    });
+  });
+
+  it('does not let database overrides mutate an operator-owned stdio server', () => {
+    const base = {
+      ...baseConfig,
+      mcpConfig: {
+        operator: { type: 'stdio', command: 'node', args: ['trusted-server.js'] },
+      },
+    } as unknown as AppConfig;
+    const configs = [
+      fakeConfig(
+        {
+          mcpServers: {
+            operator: { command: '/bin/sh', args: ['-c', 'id'] },
+          },
+        },
+        10,
+      ),
+    ];
+
+    const result = mergeConfigOverrides(base, configs) as unknown as Record<string, unknown>;
+    const mcpConfig = result.mcpConfig as Record<string, unknown>;
+
+    expect(mcpConfig.operator).toEqual({
+      type: 'stdio',
+      command: 'node',
+      args: ['trusted-server.js'],
+    });
+  });
+
+  it('does not let scalar database overrides disable an operator-owned stdio server', () => {
+    const base = {
+      ...baseConfig,
+      mcpConfig: {
+        operator: { type: 'stdio', command: 'node', args: ['trusted-server.js'] },
+      },
+    } as unknown as AppConfig;
+    const configs = [
+      fakeConfig(
+        {
+          mcpServers: {
+            operator: null,
+          },
+        },
+        10,
+      ),
+    ];
+
+    const result = mergeConfigOverrides(base, configs) as unknown as Record<string, unknown>;
+    const mcpConfig = result.mcpConfig as Record<string, unknown>;
+
+    expect(mcpConfig.operator).toEqual({
+      type: 'stdio',
+      command: 'node',
+      args: ['trusted-server.js'],
+    });
+  });
+
+  it('drops process-backed MCP servers supplied through the runtime config alias', () => {
+    const configs = [
+      fakeConfig(
+        {
+          mcpConfig: {
+            injected: { command: '/bin/sh', args: ['-c', 'id'] },
+          },
+        },
+        10,
+      ),
+    ];
+
+    const result = mergeConfigOverrides(baseConfig, configs) as unknown as Record<string, unknown>;
+
+    expect(result.mcpConfig).toEqual({});
+  });
+
   it('applies tombstones after remapping YAML paths to AppConfig paths', () => {
     const base = {
       mcpConfig: {
@@ -458,6 +658,46 @@ describe('mergeConfigOverrides', () => {
     expect(baseMcpConfig.github).toEqual({
       type: 'streamable-http',
       url: 'https://github.example.com',
+    });
+  });
+
+  it.each(['mcpServers.operator', 'mcpServers.operator.command'])(
+    'does not let the %s tombstone alter an operator-owned stdio server',
+    (tombstone) => {
+      const base = {
+        mcpConfig: {
+          operator: { type: 'stdio', command: 'node', args: ['trusted-server.js'] },
+        },
+      } as unknown as AppConfig;
+
+      const result = mergeConfigOverrides(base, [
+        fakeConfig({}, 10, [tombstone]),
+      ]) as unknown as Record<string, unknown>;
+      const mcpConfig = result.mcpConfig as Record<string, unknown>;
+
+      expect(mcpConfig.operator).toEqual({
+        type: 'stdio',
+        command: 'node',
+        args: ['trusted-server.js'],
+      });
+    },
+  );
+
+  it('preserves operator-owned stdio servers when the MCP section is tombstoned', () => {
+    const base = {
+      mcpConfig: {
+        operator: { type: 'stdio', command: 'node', args: ['trusted-server.js'] },
+        remote: { type: 'streamable-http', url: 'https://mcp.example.com' },
+      },
+    } as unknown as AppConfig;
+
+    const result = mergeConfigOverrides(base, [
+      fakeConfig({}, 10, ['mcpServers']),
+    ]) as unknown as Record<string, unknown>;
+    const mcpConfig = result.mcpConfig as Record<string, unknown>;
+
+    expect(mcpConfig).toEqual({
+      operator: { type: 'stdio', command: 'node', args: ['trusted-server.js'] },
     });
   });
 

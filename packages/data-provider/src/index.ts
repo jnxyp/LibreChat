@@ -6,6 +6,8 @@ export * from './config';
 export * from './file-config';
 /* messages  */
 export * from './messages';
+/* run steps */
+export * from './runSteps';
 /* artifacts  */
 export * from './artifacts';
 /* schema helpers  */
@@ -36,7 +38,13 @@ export * from './accessPermissions';
 export * from './keys';
 /* api call helpers */
 export * from './headers-helpers';
-export { loginPage, registerPage, apiBaseUrl, buildLoginRedirectUrl } from './api-endpoints';
+export {
+  loginPage,
+  registerPage,
+  apiBaseUrl,
+  sharedFileDownload,
+  buildLoginRedirectUrl,
+} from './api-endpoints';
 export { default as request } from './request';
 export { dataService };
 import * as dataService from './data-service';
