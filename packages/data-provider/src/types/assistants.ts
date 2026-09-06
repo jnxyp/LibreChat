@@ -1,5 +1,5 @@
 import type { OpenAPIV3 } from 'openapi-types';
-import type { AssistantsEndpoint, AgentProvider, MemoryScope } from 'src/schemas';
+import type { AssistantsEndpoint, AgentProvider, MemoryScope, SkillsScope } from 'src/schemas';
 import type { StatefulCodeEnvironment } from '../stateful-code';
 import type { Agents, GraphEdge } from './agents';
 import type { ContentTypes } from './runs';
@@ -270,14 +270,41 @@ export type AgentToolOptions = Record<string, ToolOptions>;
 /**
  * Configuration for spawning subagents (isolated-context child agents) from an agent.
  * When `enabled` is true, the agent gets a subagent-spawn tool that can delegate work
- * to either itself (when `allowSelf` is true) and/or the listed `agent_ids`.
+ * to itself, listed single-agent targets, and/or explicit saved-agent teams.
  */
+export type AgentSubagentGraphEdge = Omit<
+  GraphEdge,
+  'edgeType' | 'condition' | 'prompt' | 'promptKey'
+> & {
+  edgeType: 'direct';
+  condition?: never;
+  prompt?: string;
+  promptKey?: never;
+};
+
+/** A bounded saved-agent team that can be spawned as one isolated child graph. */
+export type AgentSubagentGraph = {
+  /** Stable spawn-tool enum value for the team. */
+  type: string;
+  name: string;
+  description: string;
+  /** Member IDs. In create/update payloads, an empty ID refers to the current agent. */
+  agent_ids: string[];
+  edges: AgentSubagentGraphEdge[];
+  /** Entry member ID. In create/update payloads, an empty ID refers to the current agent. */
+  entry_agent_id: string;
+  /** Result member ID. In create/update payloads, an empty ID refers to the current agent. */
+  result_agent_id: string;
+};
+
 export type AgentSubagentsConfig = {
   enabled?: boolean;
   /** When true (default), the agent may spawn itself in an isolated context. */
   allowSelf?: boolean;
   /** Specific agents that may be spawned as subagents. */
   agent_ids?: string[];
+  /** Explicit saved-agent teams that may be spawned as bounded child graphs. */
+  graphs?: AgentSubagentGraph[];
 };
 
 export type Agent = {
@@ -310,6 +337,8 @@ export type Agent = {
   stateful_code_sessions?: boolean;
   /** Stateful workspace sharing scope. Defaults to one workspace per user. */
   stateful_code_environment?: StatefulCodeEnvironment;
+  /** Operator-configured managed or attached stateful execution environment. */
+  code_environment_id?: string | null;
   artifacts?: ArtifactModes;
   recursion_limit?: number;
   isPublic?: boolean;
@@ -332,11 +361,17 @@ export type Agent = {
   owner_contact?: AgentOwnerContact;
   /** Per-tool configuration options (deferred loading, allowed callers, etc.) */
   tool_options?: AgentToolOptions;
+  /** Attached action registrations, each `${encodedDomain}${actionDelimiter}${action_id}` */
+  actions?: string[];
   /** Optional allowlist of skill ObjectIds. Only applies when `skills_enabled`. */
   skills?: string[];
   /** Master toggle for skill use on this agent. `true` = active (full catalog unless
    *  `skills` narrows it). `false`/undefined = inactive (no skills available). */
   skills_enabled?: boolean;
+  /** Enables runtime skill creation without exposing an existing skill catalog. */
+  skill_authoring_enabled?: boolean;
+  /** Explicit catalog exposure while skills are enabled. Missing preserves legacy semantics. */
+  skills_scope?: SkillsScope;
   /** Subagent spawning configuration — isolated-context child agents. */
   subagents?: AgentSubagentsConfig;
   /** Memory partition: `agent` isolates memories per (user, agent); default shared pool */
@@ -363,6 +398,7 @@ export type AgentCreateParams = {
   | 'hide_sequential_outputs'
   | 'stateful_code_sessions'
   | 'stateful_code_environment'
+  | 'code_environment_id'
   | 'artifacts'
   | 'recursion_limit'
   | 'category'
@@ -370,6 +406,8 @@ export type AgentCreateParams = {
   | 'tool_options'
   | 'skills'
   | 'skills_enabled'
+  | 'skill_authoring_enabled'
+  | 'skills_scope'
   | 'subagents'
   | 'memory_scope'
 >;
@@ -393,6 +431,7 @@ export type AgentUpdateParams = {
   | 'hide_sequential_outputs'
   | 'stateful_code_sessions'
   | 'stateful_code_environment'
+  | 'code_environment_id'
   | 'artifacts'
   | 'recursion_limit'
   | 'category'
@@ -400,6 +439,8 @@ export type AgentUpdateParams = {
   | 'tool_options'
   | 'skills'
   | 'skills_enabled'
+  | 'skill_authoring_enabled'
+  | 'skills_scope'
   | 'subagents'
   | 'memory_scope'
 >;
@@ -611,10 +652,20 @@ export type PartMetadata = {
    * as dispatch time rather than the task's runtime.
    */
   backgrounded?: boolean;
+  /**
+   * Content index this part occupied while its run streamed. The aggregator
+   * writes parts at provider-source indexes, so the streamed array is sparse;
+   * persistence compacts it and every part after a hole shifts down. The
+   * client's final handler stamps the streamed position onto the compacted
+   * parts it adopts, so index-derived render identity survives the swap
+   * instead of remounting the settled message. Client-only and absent
+   * everywhere else — persisted content never carries it.
+   */
+  streamedIndex?: number;
 };
 
 /** Metadata for parallel content rendering - subset of PartMetadata */
-export type ContentMetadata = Pick<PartMetadata, 'agentId' | 'groupId'>;
+export type ContentMetadata = Pick<PartMetadata, 'agentId' | 'groupId' | 'streamedIndex'>;
 
 export type ContentPart = (
   | CodeToolCall
@@ -660,6 +711,10 @@ export type SteerContentPart = {
   /** Attachments steered with the message; re-encoded per turn on replay
    *  like any other user-message media (refs only, never encoded data). */
   files?: Partial<TFile>[];
+  /** Quoted excerpts steered with the message, persisted separately from the
+   *  typed text (mirroring `TMessage.quotes`) so the UI renders them as
+   *  reference blocks; merged into the model-bound user turn on every replay. */
+  quotes?: string[];
 };
 
 export type TMessageContentParts =
@@ -683,6 +738,9 @@ export type TMessageContentParts =
       reasoning_label_revision?: number;
       /** Whether the reasoning step can still produce a newer label. */
       reasoning_label_status?: 'streaming' | 'complete';
+      /** The reasoning happened but its text is not available to this view
+       *  (e.g. detached subagent projections retain only a marker). */
+      reasoning_unavailable?: boolean;
     } & ContentMetadata)
   | (SteerContentPart & ContentMetadata)
   | ({

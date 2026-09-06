@@ -59,8 +59,12 @@ function sanitizeImportedMessage(message) {
   const text = castPersistedImportedText(message.text);
   const content = normalizeImportedArray(message.content);
   const attachments = normalizeImportedArray(message.attachments);
+  const importable = { ...message };
+  /** Server-private run state never comes from an import. */
+  delete importable.contextMeta;
   return {
-    ...message,
+    ...importable,
+    isUserSubmitted: true,
     ...(text !== message.text && { text }),
     ...(sanitizeTextMarkers &&
       typeof text === 'string' && { text: stripMessageUIResourceMarkers(text, false) }),
@@ -238,6 +242,7 @@ async function importClaudeConvo(
           text: textContent,
           sender: isCreatedByUser ? 'user' : 'Claude',
           isCreatedByUser,
+          isUserSubmitted: true,
           user: requestUserId,
           endpoint: EModelEndpoint.anthropic,
           createdAt,
@@ -335,6 +340,7 @@ async function importLibreChatConvo(
           const flatMessage = {
             ...message,
             parentMessageId: parentMessageId,
+            isUserSubmitted: true,
             children: undefined, // Remove children from flat structure
           };
           flatMessages.push(flatMessage);
@@ -577,6 +583,7 @@ function processConversation(conv, importBatchBuilder, requestUserId, defaultMod
       text: messageText,
       sender,
       isCreatedByUser,
+      isUserSubmitted: true,
       model,
       user: requestUserId,
       endpoint: EModelEndpoint.openAI,

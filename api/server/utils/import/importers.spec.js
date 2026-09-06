@@ -317,18 +317,22 @@ describe('importChatGptConvo', () => {
 
     expect(userMsg1.sender).toBe('user');
     expect(userMsg1.isCreatedByUser).toBe(true);
+    expect(userMsg1.isUserSubmitted).toBe(true);
     expect(userMsg1.model).toBe('gpt-4');
 
     expect(userMsg2.sender).toBe('user');
     expect(userMsg2.isCreatedByUser).toBe(true);
+    expect(userMsg2.isUserSubmitted).toBe(true);
     expect(userMsg2.model).toBe('gpt-4o-mini');
 
     expect(assistantMsg1.sender).toBe('GPT-4');
     expect(assistantMsg1.isCreatedByUser).toBe(false);
+    expect(assistantMsg1.isUserSubmitted).toBe(true);
     expect(assistantMsg1.model).toBe('gpt-4');
 
     expect(assistantMsg2.sender).toBe('GPT-3.5-turbo');
     expect(assistantMsg2.isCreatedByUser).toBe(false);
+    expect(assistantMsg2.isUserSubmitted).toBe(true);
     expect(assistantMsg2.model).toBe('gpt-3.5-turbo');
   });
 
@@ -875,6 +879,16 @@ describe('importLibreChatConvo', () => {
 
     expect(importBatchBuilder.startConversation).toHaveBeenCalledWith(EModelEndpoint.openAI);
     expect(importBatchBuilder.saveMessage).toHaveBeenCalledTimes(expectedNumberOfMessages);
+    expect(
+      importBatchBuilder.saveMessage.mock.calls.every(
+        ([message]) => message.isUserSubmitted === true,
+      ),
+    ).toBe(true);
+    expect(
+      importBatchBuilder.saveMessage.mock.calls.some(
+        ([message]) => message.isCreatedByUser === false && message.isUserSubmitted === true,
+      ),
+    ).toBe(true);
     expect(importBatchBuilder.finishConversation).toHaveBeenCalledTimes(1);
     expect(importBatchBuilder.saveBatch).toHaveBeenCalled();
   });
@@ -950,6 +964,33 @@ describe('importLibreChatConvo', () => {
         },
       },
     ]);
+  });
+
+  it('drops server-private context meta from imported messages', async () => {
+    const message = {
+      messageId: 'message-1',
+      parentMessageId: Constants.NO_PARENT,
+      text: 'Imported response',
+      isCreatedByUser: false,
+      contextMeta: {
+        calibrationRatio: 1,
+        encoding: 'claude',
+        fading: { v: 1, budgetTokens: 1, masked: true },
+      },
+    };
+    const jsonData = {
+      conversationId: 'context-meta-import',
+      title: 'Context meta import',
+      recursive: false,
+      messages: [message],
+    };
+    const importBatchBuilder = new ImportBatchBuilder('user-123');
+
+    const importer = getImporter(jsonData);
+    await importer(jsonData, 'user-123', () => importBatchBuilder);
+
+    expect(importBatchBuilder.messages[0]).not.toHaveProperty('contextMeta');
+    expect(importBatchBuilder.messages[0].isUserSubmitted).toBe(true);
   });
 
   it('sanitizes singleton content and attachment fields before Mongoose array casting', async () => {
@@ -1080,6 +1121,7 @@ describe('importLibreChatConvo', () => {
     // Get the imported messages
     const messages = importBatchBuilder.messages;
     expect(messages.length).toBeGreaterThan(0);
+    expect(messages.every((message) => message.isUserSubmitted === true)).toBe(true);
 
     // Build maps for verification
     const textToMessageMap = new Map();
@@ -1657,12 +1699,14 @@ describe('importClaudeConvo', () => {
     // Check user message
     const userMsg = savedMessages.find((msg) => msg.text === 'Hello Claude');
     expect(userMsg.isCreatedByUser).toBe(true);
+    expect(userMsg.isUserSubmitted).toBe(true);
     expect(userMsg.sender).toBe('user');
     expect(userMsg.endpoint).toBe(EModelEndpoint.anthropic);
 
     // Check assistant message
     const assistantMsg = savedMessages.find((msg) => msg.text === 'Hello! How can I help you?');
     expect(assistantMsg.isCreatedByUser).toBe(false);
+    expect(assistantMsg.isUserSubmitted).toBe(true);
     expect(assistantMsg.sender).toBe('Claude');
     expect(assistantMsg.parentMessageId).toBe(userMsg.messageId);
   });

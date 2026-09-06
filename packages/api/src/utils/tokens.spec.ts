@@ -7,6 +7,12 @@ describe('getModelMaxTokens partial-override fallback', () => {
     'custom-model': { prompt: 1, completion: 2, context: 32000, output: 4096 },
   };
 
+  it('returns undefined for non-string model values from JavaScript consumers', () => {
+    for (const model of [undefined, null, 123]) {
+      expect(getModelMaxTokens(model as unknown as string)).toBeUndefined();
+    }
+  });
+
   it('uses the override for a listed model', () => {
     expect(getModelMaxTokens('custom-model', EModelEndpoint.openAI, partialOverride)).toBe(32000);
   });
@@ -16,6 +22,18 @@ describe('getModelMaxTokens partial-override fallback', () => {
     const builtin = getModelMaxTokens('gpt-4o', EModelEndpoint.openAI);
     expect(fallback).toBe(builtin);
     expect(fallback).toBeGreaterThan(100000);
+  });
+});
+
+describe('future Claude context windows', () => {
+  it('uses the 1M profile for future Sonnet and Opus model IDs', () => {
+    for (const model of ['claude-sonnet-6', 'claude-opus-6']) {
+      expect(getModelMaxTokens(model, EModelEndpoint.anthropic)).toBe(1000000);
+    }
+  });
+
+  it('keeps the safe Claude fallback for unsupported model families', () => {
+    expect(getModelMaxTokens('claude-haiku-4', EModelEndpoint.anthropic)).toBe(100000);
   });
 });
 
@@ -58,6 +76,18 @@ describe('Gemini 3.7 Flash', () => {
       1048576,
     );
     expect(getModelMaxTokens('gemini-3', EModelEndpoint.google)).toBe(1000000);
+  });
+});
+
+describe('Gemini 3.8 Flash', () => {
+  it('resolves the 1,048,576-token context window', () => {
+    expect(getModelMaxTokens('gemini-3.8-flash', EModelEndpoint.google)).toBe(1048576);
+  });
+
+  it('matches the longest key over the shorter gemini-3 pattern for aliases', () => {
+    expect(getModelMaxTokens('models/gemini-3.8-flash-latest', EModelEndpoint.google)).toBe(
+      1048576,
+    );
   });
 });
 

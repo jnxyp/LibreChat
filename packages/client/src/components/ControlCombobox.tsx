@@ -5,6 +5,7 @@ import { Search, ChevronDown } from 'lucide-react';
 import { SelectRenderer } from '@ariakit/react-components/select/select-renderer';
 import type { OptionWithIcon } from '~/common';
 import { usePopoverZIndex } from './OriginalDialog';
+import { fieldControl } from './Field';
 import './AnimatePopover.css';
 import { JSX } from 'react/jsx-runtime';
 import { cn } from '~/utils';
@@ -14,7 +15,10 @@ interface ControlComboboxProps {
   displayValue?: string;
   items: OptionWithIcon[];
   setValue: (value: string) => void;
+  onBlur?: React.FocusEventHandler<HTMLButtonElement>;
   ariaLabel: string;
+  ariaInvalid?: boolean;
+  ariaDescribedBy?: string;
   searchPlaceholder?: string;
   selectPlaceholder?: string;
   isCollapsed: boolean;
@@ -29,6 +33,8 @@ interface ControlComboboxProps {
   placement?: Ariakit.SelectStoreProps['placement'];
   popoverClassName?: string;
   matchTriggerWidth?: boolean;
+  /** `field` matches the `Input` primitive so this can sit in a form row. */
+  variant?: 'default' | 'field';
   gutter?: number;
   /**
    * Radix dialogs trap focus, so a portaled popover rendered outside the dialog
@@ -37,6 +43,10 @@ interface ControlComboboxProps {
    * the popover is not clipped.
    */
   portal?: boolean;
+  /** Told when the popover opens and closes, for hosts that must behave
+   *  differently while it is up — e.g. a focus-trapped panel whose own Escape
+   *  handler must not fire while an open popover owns the key. */
+  onOpenChange?: (open: boolean) => void;
 }
 
 const ROW_HEIGHT = 36;
@@ -46,7 +56,10 @@ function ControlCombobox({
   displayValue,
   items,
   setValue,
+  onBlur,
   ariaLabel,
+  ariaInvalid,
+  ariaDescribedBy,
   searchPlaceholder,
   selectPlaceholder,
   containerClassName,
@@ -61,8 +74,10 @@ function ControlCombobox({
   placement,
   popoverClassName,
   matchTriggerWidth = true,
+  variant = 'default',
   gutter = 4,
   portal = true,
+  onOpenChange,
 }: ControlComboboxProps): JSX.Element {
   const [searchValue, setSearchValue] = useState('');
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -88,6 +103,7 @@ function ControlCombobox({
     defaultItems: items.map(getItem),
     value: selectedValue,
     setValue,
+    setOpen: onOpenChange,
     placement,
   });
 
@@ -136,7 +152,13 @@ function ControlCombobox({
   );
 
   return (
-    <div className={cn('flex w-full items-center justify-center px-1', containerClassName)}>
+    <div
+      className={cn(
+        'flex w-full items-center justify-center px-1',
+        variant === 'field' && 'px-0',
+        containerClassName,
+      )}
+    >
       <Ariakit.SelectLabel store={select} className="sr-only">
         {ariaLabel}
       </Ariakit.SelectLabel>
@@ -145,11 +167,15 @@ function ControlCombobox({
         store={select}
         id={selectId}
         disabled={disabled}
+        onBlur={onBlur}
+        aria-invalid={ariaInvalid || undefined}
+        aria-describedby={ariaDescribedBy}
         className={cn(
           'flex items-center justify-center gap-2 rounded-full bg-surface-secondary',
           'text-text-primary hover:bg-surface-tertiary',
           'border border-border-light',
           isCollapsed ? 'h-9 w-9' : 'h-9 w-full rounded-xl px-3 py-2 text-sm',
+          variant === 'field' && cn(fieldControl, 'justify-start hover:bg-surface-hover'),
           className,
         )}
       >
