@@ -4,18 +4,23 @@ import {
   Constants,
   isAgentsEndpoint,
   isEphemeralAgentId,
+  getEphemeralSender,
   appendAgentIdSuffix,
   encodeEphemeralAgentId,
 } from 'librechat-data-provider';
-import type {
-  Agent,
-  TConversation,
-  TModelSpec,
-  AgentSubagentsConfig,
-} from 'librechat-data-provider';
+import type { Agent, AgentToolOptions, TConversation, TModelSpec } from 'librechat-data-provider';
 import type { AppConfig } from '@librechat/data-schemas';
+import type { ParsedServerConfig } from '~/mcp/types';
+import {
+  requiresEphemeralUserConnection,
+  filterChatSelectableMCPServers,
+  validateMCPServerConfig,
+} from '~/mcp/utils';
+import { ASK_USER_QUESTION_TOOL_NAME } from '~/agents/hitl/askUserQuestionTool';
+import { synthesizeBackgroundToolOptions } from '~/agents/background';
+import { mergeSynthesizedToolOptions } from '~/agents/selection';
+import { synthesizeIntentToolOptions } from '~/agents/intent';
 import { getCustomEndpointConfig } from '~/app/config';
-import { sanitizeRequestSubagents } from './subagents';
 
 const { mcp_all, mcp_delimiter } = Constants;
 
@@ -43,11 +48,9 @@ function applyModelSpecSkills(
 function applyModelSpecSubagents(
   result: Record<string, unknown>,
   modelSpec: Pick<TModelSpec, 'subagents'> | null | undefined,
-  ephemeralAgent?: { subagents?: AgentSubagentsConfig },
 ): void {
-  const subagents = modelSpec?.subagents ?? sanitizeRequestSubagents(ephemeralAgent?.subagents);
-  if (subagents) {
-    result.subagents = subagents;
+  if (modelSpec?.subagents) {
+    result.subagents = modelSpec.subagents;
   }
 }
 
@@ -56,11 +59,19 @@ export interface LoadAddedAgentDeps {
   getMCPServerTools: (
     userId: string,
     serverName: string,
+    serverConfig?: ParsedServerConfig,
   ) => Promise<Record<string, unknown> | null>;
+  /** The MCP servers this user can reach, with the registry's tier precedence
+   *  already applied — the resolution behind the client's catalog. Omitted, the
+   *  chat selection is used as sent. */
+  getAccessibleMCPServers?: (
+    userId: string,
+    role?: string,
+  ) => Promise<Record<string, ParsedServerConfig>>;
 }
 
 interface LoadAddedAgentParams {
-  req: { user?: { id?: string }; config?: Record<string, unknown> };
+  req: { user?: { id?: string; role?: string }; config?: Record<string, unknown> };
   conversation: TConversation | null;
   primaryAgent?: Agent | null;
 }
@@ -105,7 +116,7 @@ export async function loadAddedAgent(
       file_search?: boolean;
       web_search?: boolean;
       artifacts?: unknown;
-      subagents?: AgentSubagentsConfig;
+      memory?: boolean;
     };
     [key: string]: unknown;
   };
@@ -123,7 +134,10 @@ export async function loadAddedAgent(
         file_search?: boolean;
         web_search?: boolean;
         artifacts?: unknown;
-        subagents?: AgentSubagentsConfig;
+        memory?: boolean;
+        ask_user_question?: boolean;
+        run_in_background?: boolean;
+        describe_intent?: boolean;
       }
     | undefined;
 
@@ -144,11 +158,11 @@ export async function loadAddedAgent(
 
     const modelSpecs = (appConfig?.modelSpecs as { list?: TModelSpec[] })?.list;
     const modelSpec = spec != null && spec !== '' ? modelSpecs?.find((s) => s.name === spec) : null;
-    const sender =
-      rest.modelLabel ??
-      modelSpec?.label ??
-      (endpointConfig?.modelDisplayLabel as string | undefined) ??
-      '';
+    const sender = getEphemeralSender({
+      modelLabel: rest.modelLabel,
+      specLabel: modelSpec?.label,
+      modelDisplayLabel: endpointConfig?.modelDisplayLabel as string | undefined,
+    });
     const ephemeralId = encodeEphemeralAgentId({ endpoint, model, sender, index: 1 });
 
     const result: Record<string, unknown> = {
@@ -160,12 +174,35 @@ export async function loadAddedAgent(
       tools: [...primaryAgent.tools],
     };
     applyModelSpecSkills(result, modelSpec);
-    applyModelSpecSubagents(result, modelSpec, ephemeralAgent);
+    applyModelSpecSubagents(result, modelSpec);
+    const primaryBackgroundToolOptions: AgentToolOptions | undefined =
+      synthesizeBackgroundToolOptions({ ephemeralAgent, modelSpec });
+    if (primaryBackgroundToolOptions) {
+      result.tool_options = primaryBackgroundToolOptions;
+    }
+    const primaryIntentToolOptions: AgentToolOptions | undefined = synthesizeIntentToolOptions({
+      ephemeralAgent,
+      modelSpec,
+    });
+    if (primaryIntentToolOptions) {
+      result.tool_options = mergeSynthesizedToolOptions(
+        result.tool_options as AgentToolOptions | undefined,
+        primaryIntentToolOptions,
+      );
+    }
     return result as unknown as Agent;
   }
 
-  const mcpServers = new Set<string>(ephemeralAgent?.mcp);
   const userId = req.user?.id ?? '';
+  /** Narrowed like the primary ephemeral loader: picker selection only, spec
+   *  servers added below. */
+  const mcpServers = new Set<string>(
+    await filterChatSelectableMCPServers(ephemeralAgent?.mcp, {
+      userId,
+      role: req.user?.role,
+      getAccessibleMCPServers: deps.getAccessibleMCPServers,
+    }),
+  );
 
   const modelSpecs = (appConfig?.modelSpecs as { list?: TModelSpec[] })?.list;
   let modelSpec: (typeof modelSpecs extends Array<infer T> | undefined ? T : never) | null = null;
@@ -188,13 +225,29 @@ export async function loadAddedAgent(
   if (ephemeralAgent?.web_search === true || modelSpec?.webSearch === true) {
     tools.push(Tools.web_search);
   }
+  if (ephemeralAgent?.memory === true || modelSpec?.memory === true) {
+    tools.push(Tools.memory);
+  }
+  /** Mirror the primary ephemeral loader (`loadEphemeralAgent`) so a model
+   *  spec's Ask User flag equips the added top-level agent too; downstream
+   *  `createRun` gating (hitlCapable, non-subagent, admin filter) is uniform. */
+  if (ephemeralAgent?.ask_user_question === true || modelSpec?.askUserQuestion === true) {
+    tools.push(ASK_USER_QUESTION_TOOL_NAME);
+  }
 
   const addedServers = new Set<string>();
   for (const mcpServer of mcpServers) {
     if (addedServers.has(mcpServer)) {
       continue;
     }
-    const serverTools = await deps.getMCPServerTools(userId, mcpServer);
+    /** Address durable catalogs by the effective request overlay; request-scoped
+     *  overlays still expand fresh through `mcp_all`. */
+    const rawOverlayConfig = appConfig?.mcpConfig?.[mcpServer];
+    const overlayConfig = rawOverlayConfig ? validateMCPServerConfig(rawOverlayConfig) : undefined;
+    const serverTools =
+      overlayConfig && requiresEphemeralUserConnection(overlayConfig)
+        ? null
+        : await deps.getMCPServerTools(userId, mcpServer, overlayConfig);
     if (!serverTools) {
       tools.push(`${mcp_all}${mcp_delimiter}${mcpServer}`);
       addedServers.add(mcpServer);
@@ -235,11 +288,11 @@ export async function loadAddedAgent(
     }
   }
 
-  const sender =
-    rest.modelLabel ??
-    modelSpec?.label ??
-    (endpointConfig?.modelDisplayLabel as string | undefined) ??
-    '';
+  const sender = getEphemeralSender({
+    modelLabel: rest.modelLabel,
+    specLabel: modelSpec?.label,
+    modelDisplayLabel: endpointConfig?.modelDisplayLabel as string | undefined,
+  });
   const ephemeralId = encodeEphemeralAgentId({ endpoint, model, sender, index: 1 });
 
   const result: Record<string, unknown> = {
@@ -254,8 +307,26 @@ export async function loadAddedAgent(
   if (ephemeralAgent?.artifacts != null && ephemeralAgent.artifacts) {
     result.artifacts = ephemeralAgent.artifacts;
   }
-  applyModelSpecSubagents(result, modelSpec, ephemeralAgent);
+  applyModelSpecSubagents(result, modelSpec);
   applyModelSpecSkills(result, modelSpec);
+
+  const backgroundToolOptions: AgentToolOptions | undefined = synthesizeBackgroundToolOptions({
+    ephemeralAgent,
+    modelSpec,
+  });
+  if (backgroundToolOptions) {
+    result.tool_options = backgroundToolOptions;
+  }
+  const intentToolOptions: AgentToolOptions | undefined = synthesizeIntentToolOptions({
+    ephemeralAgent,
+    modelSpec,
+  });
+  if (intentToolOptions) {
+    result.tool_options = mergeSynthesizedToolOptions(
+      result.tool_options as AgentToolOptions | undefined,
+      intentToolOptions,
+    );
+  }
 
   return result as unknown as Agent;
 }
