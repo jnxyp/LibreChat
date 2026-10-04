@@ -12,7 +12,7 @@ services:
     depends_on:
       - mongodb
       - rag_api
-    image: registry.librechat.ai/librechat-ai/librechat-dev:latest
+    image: registry.librechat.ai/librechat-ai/librechat:v0.8.8
     restart: always
     user: "${UID}:${GID}"
     extra_hosts:
