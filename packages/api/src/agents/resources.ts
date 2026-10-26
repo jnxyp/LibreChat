@@ -784,6 +784,7 @@ const computeProvisionState = async ({
 };
 
 export const primeResources = async ({
+  imageEditFiles = [],
   req,
   principal,
   appConfig,
@@ -811,6 +812,8 @@ export const primeResources = async ({
   principal?: Pick<IUser, 'id' | 'role'>;
   appConfig?: AppConfig;
   requestFileSet: Set<string>;
+  /** Owner-hydrated, active-thread references; tool inputs only, not vision replay. */
+  imageEditFiles?: Array<TFile>;
   attachments: Promise<Array<TFile | null>> | undefined;
   tool_resources: AgentToolResources | undefined;
   getFiles: TGetFiles;
@@ -982,7 +985,19 @@ export const primeResources = async ({
         {},
         {},
       );
-
+    }
+    const candidateIds = new Set(persistedResourceFiles.map((file) => file.file_id));
+    for (const file of imageEditFiles) {
+      if (!file.file_id || !file.type.startsWith('image/') || !file.height || !file.width) {
+        continue;
+      }
+      imageEditFileIdSet.add(file.file_id);
+      if (!candidateIds.has(file.file_id)) {
+        candidateIds.add(file.file_id);
+        persistedResourceFiles.push(file);
+      }
+    }
+    if (persistedResourceFiles.length > 0) {
       if (filterFiles && resourcePrincipal?.id && agentId) {
         persistedResourceFiles = await filterFiles({
           files: persistedResourceFiles,
@@ -1035,7 +1050,11 @@ export const primeResources = async ({
         contextFileIds.has(file.file_id) ||
         imageEditFileIdSet.has(file.file_id),
     );
-    if (screenPersistentFiles && persistedResourceFileIds.size > 0) {
+    // Historical image references are already hydrated and may be the only candidates.
+    if (
+      screenPersistentFiles &&
+      (persistedResourceFileIds.size > 0 || persistedResourceFiles.length > 0)
+    ) {
       const admitted = screenPersistentFiles(persistedResourceFiles);
       /* The tool primers read tool_resources ids directly and re-check only access, so
        * a record dropped here still reaches the Code API or RAG unless its id goes with
