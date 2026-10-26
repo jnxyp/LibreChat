@@ -7,6 +7,7 @@ const { tool } = require('@librechat/agents/langchain/tools');
 const { ContentTypes, EImageOutputType } = require('librechat-data-provider');
 const {
   logAxiosError,
+  withImageReferences,
   oaiToolkit,
   extractBaseURL,
   getProxyDispatcher,
@@ -231,181 +232,162 @@ Error Message: ${error.message}`);
    * Image Editing Tool
    */
   const imageEditTool = tool(
-    async ({ prompt, image_ids, quality = 'auto', size = 'auto' }, runnableConfig) => {
-      if (!prompt) {
-        throw new Error('Missing required field: prompt');
-      }
-
-      const clientConfig = { ...closureConfig };
-      const proxyDispatcher = getProxyDispatcher();
-      if (proxyDispatcher) {
-        clientConfig.fetchOptions = {
-          dispatcher: proxyDispatcher,
-        };
-      }
-
-      const formData = new FormData();
-      formData.append('model', imageModel);
-      formData.append('prompt', replaceUnwantedChars(prompt));
-      // TODO: `mask` support
-      // TODO: more than 1 image support
-      // formData.append('n', n.toString());
-      formData.append('quality', quality);
-      formData.append('size', size);
-
-      /** @type {Record<FileSources, undefined | NodeStreamDownloader<File>>} */
-      const streamMethods = {};
-
-      const requestFilesMap = Object.fromEntries(imageFiles.map((f) => [f.file_id, { ...f }]));
-
-      const orderedFiles = new Array(image_ids.length);
-      const idsToFetch = [];
-      const indexOfMissing = Object.create(null);
-
-      for (let i = 0; i < image_ids.length; i++) {
-        const id = image_ids[i];
-        const file = requestFilesMap[id];
-
-        if (file) {
-          orderedFiles[i] = file;
-        } else {
-          idsToFetch.push(id);
-          indexOfMissing[id] = i;
-        }
-      }
-
-      if (idsToFetch.length) {
-        const fetchedFiles = await getFiles(
-          {
-            user: req.user.id,
-            file_id: { $in: idsToFetch },
-            height: { $exists: true },
-            width: { $exists: true },
-          },
-          {},
-          {},
-        );
-
-        for (const file of fetchedFiles) {
-          requestFilesMap[file.file_id] = file;
-          orderedFiles[indexOfMissing[file.file_id]] = file;
-        }
-      }
-      for (const imageFile of orderedFiles) {
-        if (!imageFile) {
-          continue;
-        }
-        /** @type {NodeStream<File>} */
-        let stream;
-        /** @type {NodeStreamDownloader<File>} */
-        let getDownloadStream;
-        const source = imageFile.source || appFileStrategy;
-        if (!source) {
-          throw new Error('No source found for image file');
-        }
-        if (streamMethods[source]) {
-          getDownloadStream = streamMethods[source];
-        } else {
-          ({ getDownloadStream } = getStrategyFunctions(source));
-          streamMethods[source] = getDownloadStream;
-        }
-        if (!getDownloadStream) {
-          throw new Error(`No download stream method found for source: ${source}`);
-        }
-        stream = await getDownloadStream(req, imageFile.filepath);
-        if (!stream) {
-          throw new Error('Failed to get download stream for image file');
-        }
-        formData.append('image[]', stream, {
-          filename: imageFile.filename,
-          contentType: imageFile.type,
-        });
-      }
-
-      /** @type {import('axios').RawAxiosHeaders} */
-      let headers = {
-        ...formData.getHeaders(),
-      };
-
-      if (process.env.IMAGE_GEN_OAI_AZURE_API_VERSION && process.env.IMAGE_GEN_OAI_BASEURL) {
-        headers['api-key'] = apiKey;
-      } else {
-        headers['Authorization'] = `Bearer ${apiKey}`;
-      }
-
-      /** @type {AbortSignal} */
-      let derivedSignal = null;
-      /** @type {() => void} */
-      let abortHandler = null;
-
-      try {
-        if (runnableConfig?.signal) {
-          derivedSignal = AbortSignal.any([runnableConfig.signal]);
-          abortHandler = createAbortHandler();
-          derivedSignal.addEventListener('abort', abortHandler, { once: true });
-        }
-
-        /** @type {import('axios').AxiosRequestConfig} */
-        const axiosConfig = {
-          headers,
-          ...clientConfig,
-          signal: derivedSignal,
-          baseURL,
-        };
-
-        applyAxiosProxyConfig(axiosConfig, baseURL);
-
-        if (process.env.IMAGE_GEN_OAI_AZURE_API_VERSION && process.env.IMAGE_GEN_OAI_BASEURL) {
-          axiosConfig.params = {
-            'api-version': process.env.IMAGE_GEN_OAI_AZURE_API_VERSION,
-            ...axiosConfig.params,
-          };
-        }
-        const response = await axios.post('/images/edits', formData, axiosConfig);
-
-        if (!response.data || !response.data.data || !response.data.data.length) {
-          return returnValue(
-            'No image data returned from OpenAI API. There may be a problem with the API or your configuration.',
-          );
-        }
-
-        const base64Image = response.data.data[0].b64_json;
-        if (!base64Image) {
-          return returnValue(
-            'No image data returned from OpenAI API. There may be a problem with the API or your configuration.',
-          );
-        }
-
-        const content = [
-          {
-            type: ContentTypes.IMAGE_URL,
-            image_url: {
-              url: `data:image/${imageOutputType};base64,${base64Image}`,
+    async ({ prompt, image_ids, quality = 'auto', size = 'auto' }, runnableConfig) =>
+      withImageReferences({
+        imageIds: image_ids,
+        files: imageFiles,
+        loadFiles: (ids) =>
+          getFiles(
+            {
+              user: req.user.id,
+              ...(req.user.tenantId != null && { tenantId: req.user.tenantId }),
+              file_id: { $in: ids },
+              height: { $exists: true },
+              width: { $exists: true },
+              type: { $regex: '^image/' },
             },
-          },
-        ];
+            {},
+            {},
+          ),
+        onError: returnValue,
+        execute: async (orderedFiles) => {
+          if (!prompt) {
+            throw new Error('Missing required field: prompt');
+          }
 
-        const file_ids = [v4()];
-        const textResponse = [
-          {
-            type: ContentTypes.TEXT,
-            text:
-              displayMessage +
-              `\n\ngenerated_image_id: "${file_ids[0]}"\nreferenced_image_ids: ["${image_ids.join('", "')}"]`,
-          },
-        ];
-        return [textResponse, { content, file_ids }];
-      } catch (error) {
-        const message = '[image_edit_oai] Problem editing the image:';
-        logAxiosError({ error, message });
-        return returnValue(`Something went wrong when trying to edit the image. The OpenAI API may be unavailable:
+          const clientConfig = { ...closureConfig };
+          const proxyDispatcher = getProxyDispatcher();
+          if (proxyDispatcher) {
+            clientConfig.fetchOptions = {
+              dispatcher: proxyDispatcher,
+            };
+          }
+
+          const formData = new FormData();
+          formData.append('model', imageModel);
+          formData.append('prompt', replaceUnwantedChars(prompt));
+          // TODO: `mask` support
+          // TODO: more than 1 image support
+          // formData.append('n', n.toString());
+          formData.append('quality', quality);
+          formData.append('size', size);
+
+          /** @type {Record<FileSources, undefined | NodeStreamDownloader<File>>} */
+          const streamMethods = {};
+
+          for (const imageFile of orderedFiles) {
+            /** @type {NodeStream<File>} */
+            let stream;
+            /** @type {NodeStreamDownloader<File>} */
+            let getDownloadStream;
+            const source = imageFile.source || appFileStrategy;
+            if (!source) {
+              throw new Error('No source found for image file');
+            }
+            if (streamMethods[source]) {
+              getDownloadStream = streamMethods[source];
+            } else {
+              ({ getDownloadStream } = getStrategyFunctions(source));
+              streamMethods[source] = getDownloadStream;
+            }
+            if (!getDownloadStream) {
+              throw new Error(`No download stream method found for source: ${source}`);
+            }
+            stream = await getDownloadStream(req, imageFile.filepath);
+            if (!stream) {
+              throw new Error('Failed to get download stream for image file');
+            }
+            formData.append('image[]', stream, {
+              filename: imageFile.filename,
+              contentType: imageFile.type,
+            });
+          }
+
+          /** @type {import('axios').RawAxiosHeaders} */
+          let headers = {
+            ...formData.getHeaders(),
+          };
+
+          if (process.env.IMAGE_GEN_OAI_AZURE_API_VERSION && process.env.IMAGE_GEN_OAI_BASEURL) {
+            headers['api-key'] = apiKey;
+          } else {
+            headers['Authorization'] = `Bearer ${apiKey}`;
+          }
+
+          /** @type {AbortSignal} */
+          let derivedSignal = null;
+          /** @type {() => void} */
+          let abortHandler = null;
+
+          try {
+            if (runnableConfig?.signal) {
+              derivedSignal = AbortSignal.any([runnableConfig.signal]);
+              abortHandler = createAbortHandler();
+              derivedSignal.addEventListener('abort', abortHandler, { once: true });
+            }
+
+            /** @type {import('axios').AxiosRequestConfig} */
+            const axiosConfig = {
+              headers,
+              ...clientConfig,
+              signal: derivedSignal,
+              baseURL,
+            };
+
+            applyAxiosProxyConfig(axiosConfig, baseURL);
+
+            if (process.env.IMAGE_GEN_OAI_AZURE_API_VERSION && process.env.IMAGE_GEN_OAI_BASEURL) {
+              axiosConfig.params = {
+                'api-version': process.env.IMAGE_GEN_OAI_AZURE_API_VERSION,
+                ...axiosConfig.params,
+              };
+            }
+            const response = await axios.post('/images/edits', formData, axiosConfig);
+
+            if (!response.data || !response.data.data || !response.data.data.length) {
+              return returnValue(
+                'No image data returned from OpenAI API. There may be a problem with the API or your configuration.',
+              );
+            }
+
+            const base64Image = response.data.data[0].b64_json;
+            if (!base64Image) {
+              return returnValue(
+                'No image data returned from OpenAI API. There may be a problem with the API or your configuration.',
+              );
+            }
+
+            const content = [
+              {
+                type: ContentTypes.IMAGE_URL,
+                image_url: {
+                  url: `data:image/${imageOutputType};base64,${base64Image}`,
+                },
+              },
+            ];
+
+            const file_ids = [v4()];
+            const textResponse = [
+              {
+                type: ContentTypes.TEXT,
+                text:
+                  displayMessage +
+                  `\n\ngenerated_image_id: "${file_ids[0]}"\nreferenced_image_ids: ["${image_ids.join('", "')}"]`,
+              },
+            ];
+            return [textResponse, { content, file_ids }];
+          } catch (error) {
+            const message = '[image_edit_oai] Problem editing the image:';
+            logAxiosError({ error, message });
+            return returnValue(`Something went wrong when trying to edit the image. The OpenAI API may be unavailable:
 Error Message: ${error.message || 'Unknown error'}`);
-      } finally {
-        if (abortHandler && derivedSignal) {
-          derivedSignal.removeEventListener('abort', abortHandler);
-        }
-      }
-    },
+          } finally {
+            if (abortHandler && derivedSignal) {
+              derivedSignal.removeEventListener('abort', abortHandler);
+            }
+          }
+        },
+      }),
     oaiToolkit.image_edit_oai,
   );
 

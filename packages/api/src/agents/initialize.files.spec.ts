@@ -1,7 +1,8 @@
-import { Tools, EToolResources } from 'librechat-data-provider';
+import { Tools, Constants, EToolResources } from 'librechat-data-provider';
 import type { IConversation } from '@librechat/data-schemas';
 import {
   partitionCommittedFiles,
+  resolveImageEditFileIds,
   readResolvedConversationFiles,
   resolveResendToolResources,
 } from './initialize';
@@ -145,5 +146,41 @@ describe('resolveResendToolResources', () => {
 
   it('reports nothing for an agent with no tools', () => {
     expect([...resolveResendToolResources({ codeEnvAvailable: true })]).toEqual([]);
+  });
+});
+
+describe('resolveImageEditFileIds', () => {
+  const files = ['sibling-image', 'branch-image'];
+  it('does not prime references for agents without an image tool', () => {
+    expect(resolveImageEditFileIds({ enabled: false, conversationFileIds: files })).toEqual([]);
+  });
+  it('does not load sibling-root images for a new root turn', () => {
+    expect(
+      resolveImageEditFileIds({
+        enabled: true,
+        parentMessageId: String(Constants.NO_PARENT),
+        conversationFileIds: files,
+      }),
+    ).toEqual([]);
+  });
+  it('uses only the anchored parent chain, never the conversation-wide fallback', () => {
+    expect(
+      resolveImageEditFileIds({
+        enabled: true,
+        parentMessageId: 'parent',
+        conversationFileIds: files,
+        threadFileIds: ['branch-image'],
+      }),
+    ).toEqual(['branch-image']);
+    expect(
+      resolveImageEditFileIds({
+        enabled: true,
+        parentMessageId: 'parent',
+        conversationFileIds: files,
+      }),
+    ).toEqual([]);
+  });
+  it('supports unanchored linear continuation using authorized conversation references', () => {
+    expect(resolveImageEditFileIds({ enabled: true, conversationFileIds: files })).toEqual(files);
   });
 });
