@@ -56,7 +56,11 @@ RUN \
         sleep 10 ; \
     done
 
+FROM node AS source
+
 COPY --chown=node:node . .
+
+FROM source AS production
 
 ARG VITE_MCP_SANDBOX_URL=
 RUN \
@@ -76,6 +80,8 @@ ARG BUILD_DATE=
 ENV BUILD_COMMIT=${BUILD_COMMIT}
 ENV BUILD_BRANCH=${BUILD_BRANCH}
 ENV BUILD_DATE=${BUILD_DATE}
+LABEL org.opencontainers.image.source="https://github.com/jnxyp/LibreChat" \
+      org.opencontainers.image.revision=${BUILD_COMMIT}
 
 # Node API setup
 EXPOSE 3080
