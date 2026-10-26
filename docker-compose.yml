@@ -3,13 +3,23 @@
 
 services:
   api:
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
     container_name: LibreChat
     ports:
       - "${PORT}:${PORT}"
     depends_on:
       - mongodb
       - rag_api
-    image: registry.librechat.ai/librechat-ai/librechat-dev:latest
+    image: ${LIBRECHAT_IMAGE:-librechat-v50:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILD_COMMIT: ${BUILD_COMMIT:-}
+        BUILD_BRANCH: ${BUILD_BRANCH:-main}
+        BUILD_DATE: ${BUILD_DATE:-}
     restart: always
     user: "${UID}:${GID}"
     extra_hosts:
@@ -36,7 +46,7 @@ services:
       - ./uploads:/app/uploads
       - ./logs:/app/logs
       - ./skill:/app/skill
-      - librechat-data:/app/data
+      - ./data:/app/data
   admin-panel:
     container_name: admin-panel
     image: registry.librechat.ai/librechat-ai/librechat-admin-panel:latest
@@ -60,6 +70,7 @@ services:
     user: "${UID}:${GID}"
     volumes:
       - ./data-node:/data/db
+      - ./data-configdb:/data/configdb
     command: mongod --noauth
   meilisearch:
     container_name: chat-meilisearch
@@ -81,8 +92,11 @@ services:
       POSTGRES_PASSWORD: mypassword
     restart: always
     volumes:
-      - pgdata2:/var/lib/postgresql/data
+      - ./pgdata:/var/lib/postgresql/data
   rag_api:
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
     container_name: rag_api
     image: registry.librechat.ai/librechat-ai/librechat-rag-api-dev-lite:latest
     environment:
@@ -93,7 +107,3 @@ services:
       - vectordb
     env_file:
       - .env
-
-volumes:
-  pgdata2:
-  librechat-data:
