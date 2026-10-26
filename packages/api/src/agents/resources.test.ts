@@ -3598,3 +3598,90 @@ describe('primeResources', () => {
     });
   });
 });
+
+describe('historical image editing resources', () => {
+  const makeImage = (id: string): TFile => ({
+    user: 'user1',
+    file_id: id,
+    filename: `${id}.png`,
+    filepath: `/uploads/${id}.png`,
+    object: 'file',
+    type: 'image/png',
+    bytes: 128,
+    width: 64,
+    height: 64,
+    source: FileSources.local,
+    embedded: false,
+    usage: 0,
+  });
+  const history = makeImage('history');
+  const current = makeImage('current');
+  const setup = () => ({
+    principal: { id: 'user1', role: 'USER' },
+    appConfig: {
+      endpoints: { agents: { capabilities: [AgentCapabilities.context] } },
+    } as AppConfig,
+    getFiles: jest.fn().mockResolvedValue([]),
+    filterFiles: jest.fn().mockImplementation(({ files }) => Promise.resolve(files)),
+    requestFileSet: new Set<string>(),
+    attachments: undefined,
+    tool_resources: undefined,
+    agentId: 'agent_test',
+  });
+
+  it('primes a historical upload without resending it to vision, code or search', async () => {
+    const options = setup();
+    const result = await primeResources({ ...options, imageEditFiles: [history] });
+    expect(result.tool_resources?.image_edit?.files).toEqual([history]);
+    expect(result.attachments).toBeUndefined();
+    expect(result.tool_resources?.execute_code).toBeUndefined();
+    expect(result.tool_resources?.file_search).toBeUndefined();
+    expect(options.getFiles).not.toHaveBeenCalled();
+    expect(options.filterFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ files: [history], userId: 'user1' }),
+    );
+  });
+
+  it('keeps current and historical images available without duplicating references', async () => {
+    const result = await primeResources({
+      ...setup(),
+      requestFileSet: new Set(['current']),
+      attachments: Promise.resolve([current]),
+      imageEditFiles: [history, history, current],
+    });
+    expect(result.tool_resources?.image_edit?.files?.map((file) => file.file_id)).toEqual([
+      'history',
+      'current',
+    ]);
+    expect(result.requestAttachments).toEqual([current]);
+  });
+
+  it('drops inaccessible historical images before they reach the tool', async () => {
+    const options = setup();
+    options.filterFiles.mockResolvedValue([]);
+    const result = await primeResources({ ...options, imageEditFiles: [history] });
+    expect(result.tool_resources?.image_edit).toBeUndefined();
+  });
+
+  it('applies endpoint and content screening to the same hydrated snapshot', async () => {
+    const screenPersistentFiles = jest.fn().mockReturnValue([]);
+    const result = await primeResources({
+      ...setup(),
+      imageEditFiles: [history],
+      screenPersistentFiles,
+    });
+    expect(screenPersistentFiles).toHaveBeenCalledWith([history]);
+    expect(result.tool_resources?.image_edit).toBeUndefined();
+  });
+
+  it('does not expose files lacking image dimensions or a supported MIME type', async () => {
+    const result = await primeResources({
+      ...setup(),
+      imageEditFiles: [
+        { ...history, height: 0 },
+        { ...current, type: 'application/pdf' },
+      ],
+    });
+    expect(result.tool_resources?.image_edit).toBeUndefined();
+  });
+});

@@ -493,6 +493,24 @@ export function resolveResendToolResources({
   return toolResourceSet;
 }
 
+/** Image tools may reference this branch's history without resending it to vision. */
+export function resolveImageEditFileIds({
+  enabled,
+  parentMessageId,
+  conversationFileIds,
+  threadFileIds,
+}: {
+  enabled: boolean;
+  parentMessageId?: string | null;
+  conversationFileIds: string[];
+  threadFileIds?: string[];
+}): string[] {
+  if (!enabled || parentMessageId === Constants.NO_PARENT) {
+    return [];
+  }
+  return parentMessageId ? (threadFileIds ?? []) : conversationFileIds;
+}
+
 function getMaxCatalogSkills(runtime: AgentExecutionContext): number | undefined {
   const endpoints = runtime.appConfig?.endpoints as
     | Record<string, { skills?: { maxCatalogSkills?: number } } | undefined>
@@ -1692,6 +1710,8 @@ export async function initializeAgent(
   /** Earlier-turn attachments still awaiting provisioning; provisioning input only. */
   let deferredProvisionFiles: IMongoFile[] = [];
   let deferredProvisionFileIds: string[] = [];
+  let imageEditFileIds: string[] = [];
+  let imageEditFiles: IMongoFile[] = [];
 
   /** Build the role-gated resource set from the agent and its effective skills. */
   const resourceToolNames = [...(agent.tools ?? [])];
@@ -1728,11 +1748,14 @@ export async function initializeAgent(
     fileSearch: wantsSearchFiles,
   };
   const wantsProvisioning = wantsCodeFiles || wantsSearchFiles;
+  const wantsImageEdit = resourceToolNames.some(
+    (name) => name === 'image_gen_oai' || name === 'image_edit_oai',
+  );
 
   if (
     authorizedRunFiles === undefined &&
     conversationId != null &&
-    (resendFiles || wantsProvisioning)
+    (resendFiles || wantsProvisioning || wantsImageEdit)
   ) {
     const getThreadMessages = db.getMessages;
     /** Falsy anchors cannot match a parent chain, so they get no walk. */
@@ -1744,7 +1767,8 @@ export async function initializeAgent(
     const isRootTurn = parentMessageId === Constants.NO_PARENT;
     /* Either provisioning resource needs the anchor: deferred attachments for
      * file_search are found by thread file ids just as code files are. */
-    const needsThreadWalk = wantsProvisioning && threadAnchor != null && getThreadMessages != null;
+    const needsThreadWalk =
+      (wantsProvisioning || wantsImageEdit) && threadAnchor != null && getThreadMessages != null;
 
     /**
      * The conversation's file refs and the thread walk share no inputs, so they resolve
@@ -1787,6 +1811,15 @@ export async function initializeAgent(
      * An anchored walk keeps its own result even when empty. Widening a branch that
      * references no files to the whole conversation would provision a sibling branch's
      * attachments, sending files this branch never mentioned to the Code API or RAG. */
+    // Editing needs historical IDs even when those images are not resent to vision.
+    // An anchored request must never fall back to a sibling branch's files.
+    imageEditFileIds = resolveImageEditFileIds({
+      enabled: wantsImageEdit,
+      parentMessageId,
+      conversationFileIds: fileIds,
+      threadFileIds,
+    });
+
     const provisionFileIds = threadAnchor == null ? fileIds : (threadFileIds ?? []);
     /* Conversation.files can omit a previous turn's embedded upload. Follow the same
      * parent chain for provisioned tool files so search restores it without loading a
@@ -1878,7 +1911,14 @@ export async function initializeAgent(
    * keep this exact snapshot authoritative for inspection, priming, and the
    * later usage update to avoid a post-inspection re-read.
    */
-  const snapshotFileIds = [...requestFileIds, ...toolFileIds, ...deferredProvisionFileIds];
+  const snapshotFileIds = [
+    ...new Set([
+      ...requestFileIds,
+      ...toolFileIds,
+      ...deferredProvisionFileIds,
+      ...imageEditFileIds,
+    ]),
+  ];
   let requestUsageFiles: IMongoFile[] = [];
   let toolUsageFiles: IMongoFile[] = [];
   if (authorizedRunFiles === undefined && requestFileOwnerScope && snapshotFileIds.length > 0) {
@@ -1899,6 +1939,9 @@ export async function initializeAgent(
         .filter((file) => snapshotFileIds.includes(file.file_id))
         .map((file) => [file.file_id, file]),
     );
+    imageEditFiles = imageEditFileIds
+      .map((fileId) => hydratedFilesById.get(fileId))
+      .filter((file): file is IMongoFile => file != null);
     requestUsageFiles = requestFileIds
       .map((fileId) => hydratedFilesById.get(fileId))
       .filter((file): file is IMongoFile => file != null);
@@ -1919,6 +1962,7 @@ export async function initializeAgent(
       }
     }
     currentFiles = authorizedRunFiles.map((file) => structuredClone(file));
+    imageEditFiles = wantsImageEdit ? (currentFiles as IMongoFile[]) : [];
   } else if (requestFiles.length > 0 || toolFileIds.length > 0) {
     currentFiles = requestUsageFiles.concat(toolUsageFiles);
   }
@@ -2091,6 +2135,7 @@ export async function initializeAgent(
       : undefined,
     tool_resources: runtimeToolResources,
     requestFileSet: new Set((authorizedRunFiles ?? requestFiles).map((file) => file.file_id)),
+    imageEditFiles: imageEditFiles as unknown as TFile[],
     enabledToolResources: toolResourceSet,
     checkSessionsAlive: db.checkSessionsAlive,
     loadCodeApiKey: db.loadCodeApiKey,
